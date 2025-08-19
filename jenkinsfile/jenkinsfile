@@ -1,0 +1,240 @@
+pipeline {
+    agent any
+
+    environment {
+        BITBUCKET_CREDS = credentials('Enter your buitbcket credential Id here')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    checkout scm
+                }
+            }
+        }
+
+        stage('Run coverage script') {
+            steps {
+                script {
+                    docker.image('maven:3.6.3-openjdk-8').inside {
+                        dir('advicefit-web') {
+                            sh "mvn clean test"
+                        }
+                    }
+
+                    // inject bitbucket credentials through the block for authorization inside shell 
+                    // Also replace bitucket_creds with your own bitbucket credentials id to prevent any authorization issues
+                    withCredentials([usernamePassword(credentialsId: 'bitbucket_creds', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
+                        sh """
+                        cd advicefit-web
+
+                        echo "ℹ️  Using code already checked out by Jenkins"
+
+                        echo "🔍 PR Information:"
+                        echo "CHANGE_ID: ${CHANGE_ID}"
+                        echo "CHANGE_TARGET: ${CHANGE_TARGET}"
+                        echo "CHANGE_BRANCH: ${CHANGE_BRANCH}"
+                        echo "BRANCH_NAME: ${BRANCH_NAME}"
+
+                        if [ -z "${CHANGE_TARGET}" ]; then
+                            echo "❌ ERROR: CHANGE_TARGET is not set. Cannot determine target branch."
+                            exit 1
+                        fi
+
+                        echo "🔍 Configuring git credentials for Bitbucket..."
+                        git config --global credential.helper "!f() { echo username=$GIT_USER; echo password=$GIT_PASS; }; f"
+                
+                        echo "🔍 Ensuring full history is available for target branch..."
+                        git fetch --no-tags --prune origin +refs/heads/${CHANGE_TARGET}:refs/remotes/origin/${CHANGE_TARGET} || {
+                            echo "⚠️ Could not fetch ${CHANGE_TARGET}, retrying without depth..."
+                            git fetch origin +refs/heads/${CHANGE_TARGET}:refs/remotes/origin/${CHANGE_TARGET}
+                        }
+
+                        echo "✅ Target branch '${CHANGE_TARGET}' is now available locally:"
+                        git branch -a | head -20
+
+                        echo "📊 Generating diff between PR branch (${CHANGE_BRANCH}) and target branch (${CHANGE_TARGET})..."
+                        git diff origin/${CHANGE_TARGET} > diff.txt
+
+                        echo "📄 Diff file size: \$(wc -l < diff.txt) lines"
+                        head -20 diff.txt || echo "⚠️ Diff is empty."
+                        
+                        # This step is for fixing the path of the diff file generated it can be set according to the project directories structure
+                        # It can be avoided as well depending on the project structure the nake of your main directory where all the code , test code is present for the applicaiton 
+                        # Replace <Directory-path> with the pa
+                        sed -i.bak 's|a/<Directory-path>|a|g; s|b/<Directory-path>|b|g' diff.txt
+                        rm -f diff.txt.bak
+
+                        cd ..
+                        
+                        if [ ! -f "<Enter your Directory-path here>/target/site/jacoco/jacoco.xml" ]; then
+                            echo "❌ ERROR: JaCoCo coverage file not found at <Directory-path>/target/site/jacoco/jacoco.xml"
+                            exit 1
+                        fi
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Analyze coverage with Python') {
+            steps {
+                script {
+                    if (fileExists('<Directory-path>/diff.txt') && readFile('<Directory-path>/diff.txt').trim()) {
+                        echo "📊 Analyzing coverage for changed files using Docker..."
+                        docker.image('python:3.9-slim').inside('-u root') {
+                            sh """
+                            apt-get update -qq
+                            apt-get install -y -qq git
+                            pip install diff-cover
+                            
+                            git config --global --add safe.directory \$(pwd)
+                            git config --global --add safe.directory '*'
+                            
+                            if [ ! -s advicefit-web/diff.txt ]; then
+                                echo "❌ Diff file is empty or missing"
+                                echo "No coverage analysis possible" > coverage_report_raw.txt
+                                exit 0
+                            fi
+                            
+                            echo "📊 Diff file contents preview:"
+                            head -10 advicefit-web/diff.txt
+                            echo "📊 Diff file size: \$(wc -l < <Directory-path>/diff.txt) lines"
+                            
+                            diff-cover <Directory-path>/target/site/jacoco/jacoco.xml \\
+                                --diff-file=advicefit-web/diff.txt \\
+                                --format html:coverage_report.html \\
+                                --compare-branch=origin/${CHANGE_TARGET} > coverage_report_raw.txt
+                            
+                            cat coverage_report_raw.txt
+                            """
+                        }
+
+                        // ✅ Extract values in Groovy so they can be interpolated
+                def totalFiles = sh(script: '''grep '^+++\\|^---' advicefit-web/diff.txt | grep -v '/dev/null' | sed 's|^[+-]\\{3\\} [ab]/||' | sort -u | wc -l''', returnStdout: true).trim()
+                def javaFiles = sh(script: '''grep '^+++\\|^---' advicefit-web/diff.txt | grep -v '/dev/null' | sed 's|^[+-]\\{3\\} [ab]/||' | grep '\\.java$' | sort -u | wc -l''', returnStdout: true).trim()
+                def uncoveredLines = sh(script: '''grep -o "Missing lines [^)]*" coverage_report_raw.txt | sed "s/Missing lines //" | awk -F',' "{s+=NF} END{print s}"''', returnStdout: true).trim()
+                def coveragePercent = sh(script: '''grep -o "Coverage: [0-9.]*%" coverage_report_raw.txt | sed 's/Coverage: //' ''', returnStdout: true).trim()
+                def topFiles = sh(script: '''grep -o "src/.*\\.java ([^)]*)" coverage_report_raw.txt | head -5 | sed "s/ (/: | /" | sed "s/)//"''', returnStdout: true).trim()
+
+                // ✅ Build the coverage report in Groovy (variables will interpolate)
+                def reportText = """#### 📊 Code Coverage Report for PR #${CHANGE_ID}
+**Branch:** ${CHANGE_BRANCH} → ${CHANGE_TARGET}
+
+---
+
+### 🔍 Summary
+- 🧪 **Coverage:** **${coveragePercent}**
+- 🧱 **Java Files Changed:** ${javaFiles}
+- 🗂️ **Total Files Changed:** ${totalFiles}
+- ❌ **Uncovered Lines:** ${uncoveredLines}
+
+---
+
+### 📁 Notable Files Missing Coverage:
+| File | Missing Lines |
+|------|---------------|
+${topFiles}
+
+---
+
+✅ **Coverage analysis completed.**
+"""  
+   
+                
+                writeFile file: 'coverage_report.txt', text: reportText
+
+
+                // ✅ Threshold check + Bitbucket status
+                def threshold = 50.0
+                def coverageNum = coveragePercent.replace("%","").toDouble()
+                def commitId = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+
+                def state = (coverageNum >= threshold) ? "SUCCESSFUL" : "FAILED"
+                def description = (coverageNum >= threshold) ? 
+                    "✅ Coverage ${coveragePercent} (>= ${threshold}%)" : 
+                    "❌ Coverage ${coveragePercent} (< ${threshold}%)"
+
+                def buildKey = "coverage-check"
+                def buildUrl = "${env.BUILD_URL}"
+
+                echo "📊 Coverage = ${coveragePercent}, Threshold = ${threshold} → Result: ${state}"
+
+                sh """
+                curl -s -X POST -u ${BITBUCKET_CREDS_USR}:${BITBUCKET_CREDS_PSW} \\
+                    -H "Content-Type: application/json" \\
+                    https://api.bitbucket.org/2.0/repositories/workspace/repo/commit/${commitId}/statuses/build \\
+                    -d '{
+                        "state": "${state}",
+                        "key": "${buildKey}",
+                        "name": "Coverage Check",
+                        "url": "${buildUrl}",
+                        "description": "${description}"
+                        }'
+                """
+            } else {
+                echo "⚠️ No changes detected - creating basic coverage report"
+                writeFile file: 'coverage_report.txt', text: """📊 **Code Coverage Report for PR #${CHANGE_ID}** 
+
+No code changes detected in this PR that require coverage analysis."""
+                    }
+                }
+            }
+        }
+
+        stage('Post coverage to Bitbucket PR') {
+            when {
+                expression { return env.CHANGE_ID != null }
+            }
+            steps {
+                script {
+                    if (!fileExists('coverage_report.txt')) {
+                        echo "❌ Coverage report not found, skipping Bitbucket comment"
+                        return
+                    }
+                    // In the api URL replace workspace and repo with your own organization/workspace details
+                    def coverageComment = readFile('coverage_report.txt')
+                    def apiUrl = "https://api.bitbucket.org/2.0/repositories/workspace/repo/pullrequests/${CHANGE_ID}/comments"
+                    
+                    def escapedComment = coverageComment
+                        .replaceAll('\\\\', '\\\\\\\\')
+                        .replaceAll('"', '\\\\"')
+                        .replaceAll('\n', '\\\\n')
+                        .replaceAll('\r', '')
+                    
+                    writeFile file: 'payload.json', text: """{
+                      "content": {
+                        "raw": "${escapedComment}"
+                      }
+                    }"""
+                    
+                    echo "📤 Posting coverage report to Bitbucket PR #${CHANGE_ID}"
+                    
+                    def response = sh(
+                        script: """
+                            curl -s -w "\\nHTTPSTATUS:%{http_code}" \\
+                                 -u \${BITBUCKET_CREDS_USR}:\${BITBUCKET_CREDS_PSW} \\
+                                 -H "Content-Type: application/json" \\
+                                 -X POST "${apiUrl}" \\
+                                 --data @payload.json
+                        """,
+                        returnStdout: true
+                    )
+                    
+                    def parts = response.split("\\nHTTPSTATUS:")
+                    def responseBody = parts.length > 0 ? parts[0].trim() : ""
+                    def httpStatus = parts.length > 1 ? parts[1].trim() : "unknown"
+                    
+                    if (httpStatus == "201") {
+                        echo "✅ Coverage comment posted successfully to Bitbucket PR"
+                    } else {
+                        echo "❌ Failed to post comment. HTTP Status: ${httpStatus}"
+                        echo "Response: ${responseBody}"
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
+            }
+        }
+    }
+}
