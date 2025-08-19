@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        BITBUCKET_CREDS = credentials('Enter your buitbcket credential Id here')
+        BITBUCKET_CREDS = credentials('Enter your buitbucket credential Id here')
     }
 
     stages {
